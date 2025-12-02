@@ -20,6 +20,7 @@ from ott.solvers.linear import sinkhorn
 # 设置随机种子
 torch.manual_seed(42)
 np.random.seed(42)
+infer_cells=False
 
 # ==========================================
 # 1. 数据预处理与加载
@@ -229,7 +230,7 @@ def train_model(
     t_start, t_end,  # 绝对时间
     max_global_time,  # 最大全局时间，用于归一化
     epochs=500, batch_size=256, lr=1e-3,
-    lambda_spatial=1.0, lambda_expr=0.0, lambda_mass=0.0
+    lambda_spatial=1.0, lambda_expr=0.0, lambda_mass=1.0 if infer_cells else 0.0
 ):
     coord_dim = coords_0.shape[1]
     theta = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -341,7 +342,8 @@ def train_model_multi_segments(
     max_global_time,  # 最大全局时间，用于归一化
     epochs=500, batch_size=256, lr=1e-3,
     lambda_spatial=1.0, lambda_expr=0.0, lambda_mass=0.0,
-    segment_weights=None  # 可选：每个时间段的权重
+    segment_weights=None,  # 可选：每个时间段的权重
+    learn_alignment=False  # 是否学习每个时间段的旋转/平移对齐，默认不学习，认为已经对齐
 ):
     """
     多时间段联合训练。同时训练多个时间段，学习更通用的动力学规律。
@@ -354,13 +356,20 @@ def train_model_multi_segments(
     if len(segments_data) == 0:
         raise ValueError("至少需要一个时间段进行训练")
     
-    # 为每个时间段设置对齐参数
     coord_dim = segments_data[0][2].shape[1]  # 从第一个时间段的 coords_0 获取维度
     
-    thetas = [nn.Parameter(torch.tensor(0.0, dtype=torch.float32)) for _ in segments_data]
-    trans_list = [nn.Parameter(torch.zeros(coord_dim, dtype=torch.float32)) for _ in segments_data]
-    
-    optimizer = optim.Adam(list(model.parameters()) + thetas + trans_list, lr=lr)
+    # 为每个时间段设置对齐参数
+    if learn_alignment:
+        # 可学习的旋转和平移
+        thetas = [nn.Parameter(torch.tensor(0.0, dtype=torch.float32)) for _ in segments_data]
+        trans_list = [nn.Parameter(torch.zeros(coord_dim, dtype=torch.float32)) for _ in segments_data]
+        # 将对齐参数一并加入优化
+        optimizer = optim.Adam(list(model.parameters()) + thetas + trans_list, lr=lr)
+    else:
+        # 不学习对齐：theta 固定为 0，平移固定为 0，不加入优化器
+        thetas = [torch.tensor(0.0, dtype=torch.float32) for _ in segments_data]
+        trans_list = [torch.zeros(coord_dim, dtype=torch.float32) for _ in segments_data]
+        optimizer = optim.Adam(model.parameters(), lr=lr)
     
     # 计算每个时间段的权重
     if segment_weights is None:
@@ -425,13 +434,17 @@ def train_model_multi_segments(
         t_rel = (t_abs - t_start) / (t_end - t_start + 1e-8)
         
         # 2. 对齐与插值
-        if coord_dim == 2:
-            cos_t = torch.cos(theta)
-            sin_t = torch.sin(theta)
-            R = torch.stack([torch.stack([cos_t, -sin_t]), torch.stack([sin_t,  cos_t])])
-            c1 = (R @ c1_raw.T).T + trans
+        if learn_alignment:
+            if coord_dim == 2:
+                cos_t = torch.cos(theta)
+                sin_t = torch.sin(theta)
+                R = torch.stack([torch.stack([cos_t, -sin_t]), torch.stack([sin_t,  cos_t])])
+                c1 = (R @ c1_raw.T).T + trans
+            else:
+                c1 = c1_raw + trans
         else:
-            c1 = c1_raw + trans
+            # 不做额外旋转和平移，认为已经在同一坐标系中
+            c1 = c1_raw
 
         c_t = (1 - t_rel) * c0 + t_rel * c1
         e_t = (1 - t_rel) * e0 + t_rel * e1
@@ -465,6 +478,7 @@ def train_model_multi_segments(
             print(f"  空间损失 (Spatial Loss):  {loss_spatial.item():.6f}")
             print(f"  表达损失 (Expression):    {loss_expr.item():.6f}")
             print(f"  质量损失 (Mass Loss):      {loss_mass.item():.6f}")
+            print(f" 全局时间 (Global Time):    {global_t.mean().item():.6f}")
             print(f"{'='*60}\n")
             
     return model
@@ -519,14 +533,13 @@ def predict_evolution(
             coords_np = coords_new.numpy()
             expr_np = expr_new.numpy()
             mass_np = mass_new.numpy()
-            
             for i, cell_data in enumerate(current_cells):
                 m = mass_np[i]
                 c = coords_np[i]
                 e = expr_np[i]
                 pid = cell_data.get('parent_id', cell_data['id'])
                 
-                if m > threshold_proliferation:
+                if m > threshold_proliferation and infer_cells:
                     # 分裂
                     for child_idx in range(2):
                         noise_c = np.random.normal(0, 0.01, size=c.shape)
@@ -538,7 +551,7 @@ def predict_evolution(
                             'id': f"{cell_data['id']}_d{step}_{child_idx}",
                             'parent_id': pid
                         })
-                elif m < threshold_apoptosis:
+                elif m < threshold_apoptosis and infer_cells:
                     # 凋亡 (跳过添加)
                     pass 
                 else:
@@ -595,7 +608,7 @@ def find_time_segment(time_points, target_time):
     return (time_points[0], time_points[-1])
 
 
-def main_multi_time(input_files_dict, output_path, target_time, epochs=2000):
+def main_multi_time(input_files_dict, output_path, target_time, epochs=500):
     """
     支持多个时间点的插值预测。
     
@@ -790,7 +803,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_time", type=float, required=True, 
                        help="目标时间点（实际时间，例如 5 表示 day 5）")
     parser.add_argument("--output", type=str, required=True, help="Path to save predicted h5ad")
-    parser.add_argument("--epochs", type=int, default=2000, help="训练轮数")
+    parser.add_argument("--epochs", type=int, default=500, help="训练轮数")
     
     args = parser.parse_args()
     
