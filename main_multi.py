@@ -20,7 +20,7 @@ from ott.solvers.linear import sinkhorn
 # 设置随机种子
 torch.manual_seed(42)
 np.random.seed(42)
-
+train_alignment=False
 # ==========================================
 # 1. 数据预处理与加载
 # ==========================================
@@ -151,20 +151,40 @@ def compute_unbalanced_ot(coords_0, expr_0, coords_1, expr_1, mass_0, mass_1, ta
 # ==========================================
 # 3. 模型定义：Mass Flow Matching
 # ==========================================
-
+# === 新增：高斯傅里叶时间嵌入 ===
+class GaussianFourierProjection(nn.Module):
+    """
+    将标量时间 t 映射到高维特征向量，帮助网络感知高频变化。
+    """
+    def __init__(self, embed_dim, scale=30.0):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+    
+    def forward(self, x):
+        # x: (B, 1) -> (B, embed_dim)
+        x_proj = x * self.W[None, :] * 2 * np.pi
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+# === 修改后的模型结构 ===
 class MassFlowMatching(nn.Module):
-    def __init__(self, coord_dim=2, expression_dim=50, hidden_dim=256):
+    def __init__(self, coord_dim=2, expression_dim=50, hidden_dim=256, time_embed_dim=64):
         super().__init__()
         
-        input_dim = coord_dim + expression_dim + 1 + 1 
+        # 时间嵌入层
+        self.time_embed = GaussianFourierProjection(time_embed_dim, scale=10.0)
         
+        # 输入维度：坐标 + 表达 + 质量 + 时间嵌入
+        input_dim = coord_dim + expression_dim + 1 + time_embed_dim
+        
+        # 使用残差连接的 MLP (ResNet block) 往往效果更好，这里保持简单但增加深度
         self.state_encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(), # GELU 通常比 ReLU 平滑，适合 ODE
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU()
         )
         
         self.spatial_head = nn.Linear(hidden_dim, coord_dim)
@@ -172,23 +192,29 @@ class MassFlowMatching(nn.Module):
         
         self.mass_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Tanh() 
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1)
+            # 移除 Tanh，允许更大的增长率范围，或者保留但注意缩放
         )
 
-    def forward(self, coords, expression, mass, t):
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
+    def forward(self, coords, expression, mass, global_t):
+        if global_t.dim() == 1:
+            global_t = global_t.unsqueeze(-1)
         if mass.dim() == 1:
             mass = mass.unsqueeze(-1)
             
-        x = torch.cat([coords, expression, mass, t], dim=-1)
+        # 1. 编码时间
+        t_emb = self.time_embed(global_t) # (B, time_embed_dim)
+        
+        # 2. 拼接输入
+        x = torch.cat([coords, expression, mass, t_emb], dim=-1)
+        
+        # 3. 前向传播
         h = self.state_encoder(x)
         
         v_spatial = self.spatial_head(h)
         v_expression = self.expression_head(h)
-        mass_rate = self.mass_head(h) * 5.0 
+        mass_rate = self.mass_head(h) # 直接输出 rate
         
         return v_spatial, v_expression, mass_rate
 
@@ -225,7 +251,9 @@ def train_model(
     model, 
     coords_0, expr_0, mass_0, 
     coords_1, expr_1, mass_1, 
-    ot_matrix, 
+    ot_matrix,
+    t_start, t_end,  # 绝对时间
+    max_global_time,  # 最大全局时间，用于归一化
     epochs=500, batch_size=256, lr=1e-3,
     lambda_spatial=1.0, lambda_expr=0.0, lambda_mass=0.0
 ):
@@ -274,7 +302,13 @@ def train_model(
         
         weights = torch.tensor(ot_weights, dtype=torch.float32).unsqueeze(1)
         
-        t = torch.rand(batch_size, 1)
+        # 随机采样绝对时间（在 t_start 和 t_end 之间）
+        t_abs = torch.rand(batch_size, 1) * (t_end - t_start) + t_start
+        # 归一化到 [0, 1] 区间
+        global_t = t_abs / max_global_time
+        
+        # 计算相对时间用于插值（0.0 对应 t_start, 1.0 对应 t_end）
+        t_rel = (t_abs - t_start) / (t_end - t_start + 1e-8)
         
         # 2. 对齐与插值
         if coord_dim == 2:
@@ -285,12 +319,12 @@ def train_model(
         else:
             c1 = c1_raw + trans
 
-        c_t = (1 - t) * c0 + t * c1
-        e_t = (1 - t) * e0 + t * e1
-        m_t = (1 - t) * m0 + t * m1
+        c_t = (1 - t_rel) * c0 + t_rel * c1
+        e_t = (1 - t_rel) * e0 + t_rel * e1
+        m_t = (1 - t_rel) * m0 + t_rel * m1
         
         # 3. 预测与 Loss
-        v_spatial_pred, v_expression_pred, mass_rate_pred = model(c_t, e_t, m_t, t)
+        v_spatial_pred, v_expression_pred, mass_rate_pred = model(c_t, e_t, m_t, global_t)
         
         v_spatial_true = c1 - c0
         v_expression_true = e1 - e0
@@ -327,6 +361,158 @@ def train_model(
     return model
 
 
+def train_model_multi_segments(
+    model,
+    segments_data,  # 列表，每个元素是 (t_start, t_end, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix)
+    max_global_time,  # 最大全局时间，用于归一化
+    epochs=500, batch_size=256, lr=1e-3,
+    lambda_spatial=1.0, lambda_expr=0.0, lambda_mass=0.0,
+    segment_weights=None  # 可选：每个时间段的权重
+):
+    """
+    多时间段联合训练。同时训练多个时间段，学习更通用的动力学规律。
+    
+    Args:
+        segments_data: 列表，每个元素包含一个时间段的数据
+            [(t_start, t_end, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix), ...]
+        segment_weights: 每个时间段的采样权重，如果为None则均匀采样
+    """
+    if len(segments_data) == 0:
+        raise ValueError("至少需要一个时间段进行训练")
+    
+    # 为每个时间段设置对齐参数
+    coord_dim = segments_data[0][2].shape[1]  # 从第一个时间段的 coords_0 获取维度
+    
+    if train_alignment:
+        # 可训练的对齐参数
+        thetas = [nn.Parameter(torch.tensor(0.0, dtype=torch.float32)) for _ in segments_data]
+        trans_list = [nn.Parameter(torch.zeros(coord_dim, dtype=torch.float32)) for _ in segments_data]
+    else:
+        # 不训练，对齐固定为“已对齐”（0 旋转 / 0 平移）
+        thetas = [torch.tensor(0.0, dtype=torch.float32) for _ in segments_data]
+        trans_list = [torch.zeros(coord_dim, dtype=torch.float32) for _ in segments_data]
+    
+    params = list(model.parameters())
+    if train_alignment:
+        params += thetas + trans_list
+
+    optimizer = torch.optim.Adam(params, lr=lr)
+    
+    # 计算每个时间段的权重
+    if segment_weights is None:
+        segment_weights = [1.0 / len(segments_data)] * len(segments_data)
+    else:
+        total_weight = sum(segment_weights)
+        segment_weights = [w / total_weight for w in segment_weights]
+    
+    # 为每个时间段计算质量增长率
+    all_target_mass_ratios = []
+    for seg_idx, (t_start, t_end, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix) in enumerate(segments_data):
+        ot_row_sums = np.nan_to_num(ot_matrix.sum(axis=1), nan=0.0)
+        total_mass_t0 = np.sum(mass_0)
+        total_mass_t1 = np.sum(mass_1)
+        
+        ot_sum = ot_matrix.sum()
+        if ot_sum == 0: ot_sum = 1.0
+        relative_contribution = ot_row_sums / ot_sum
+        
+        estimated_target_mass = relative_contribution * total_mass_t1
+        mass_0_safe = np.maximum(mass_0, 1e-8)
+        target_mass_ratios = estimated_target_mass / mass_0_safe
+        target_mass_ratios = np.clip(target_mass_ratios, 1e-4, 50.0)
+        all_target_mass_ratios.append(target_mass_ratios)
+    
+    print(f"\n=== 多时间段联合训练 ===")
+    print(f"时间段数量: {len(segments_data)}")
+    for seg_idx, (t_start, t_end, _, _, _, _, _, _, _) in enumerate(segments_data):
+        print(f"  时间段 {seg_idx+1}: [{t_start}, {t_end}], 权重: {segment_weights[seg_idx]:.3f}")
+    print("========================\n")
+    
+    print("开始训练...")
+    model.train()
+    
+    for epoch in range(epochs):
+        # 随机选择时间段
+        seg_idx = np.random.choice(len(segments_data), p=segment_weights)
+        t_start, t_end, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix = segments_data[seg_idx]
+        
+        # 1. 采样 (Source, Target)
+        idx_0, idx_1, ot_weights = sample_matched_pair(ot_matrix, batch_size)
+        
+        c0 = torch.tensor(coords_0[idx_0], dtype=torch.float32)
+        e0 = torch.tensor(expr_0[idx_0], dtype=torch.float32)
+        m0 = torch.tensor(mass_0[idx_0], dtype=torch.float32).unsqueeze(1)
+        
+        c1 = torch.tensor(coords_1[idx_1], dtype=torch.float32) # 直接使用 c1，不对齐
+        e1 = torch.tensor(expr_1[idx_1], dtype=torch.float32)
+        m1 = torch.tensor(mass_1[idx_1], dtype=torch.float32).unsqueeze(1)
+        
+        weights = torch.tensor(ot_weights, dtype=torch.float32).unsqueeze(1)
+        
+        # 2. 时间采样
+        # t_local ~ U[0, 1] 用于插值
+        t_local = torch.rand(batch_size, 1)
+        
+        # t_global 用于网络输入 (归一化到 0~1 范围，但包含绝对时间信息)
+        # 比如 t_start=2, t_end=10, max=20. t_abs = 2 + 8*t_local. t_global = t_abs/20.
+        t_abs = t_start + (t_end - t_start) * t_local
+        global_t = t_abs / max_global_time
+        
+        # 3. 构建 Flow Matching 目标 (Conditional FM)
+        # 线性插值路径
+        c_t = (1 - t_local) * c0 + t_local * c1
+        e_t = (1 - t_local) * e0 + t_local * e1
+        m_t = (1 - t_local) * m0 + t_local * m1
+        
+        # 4. 预测
+        v_spatial_pred, v_expression_pred, mass_rate_pred = model(c_t, e_t, m_t, global_t)
+        
+        # 5. Ground Truth 速度
+        # 注意：速度需要关于时间归一化吗？
+        # 如果 global_t 归一化了，v 也需要对应调整。
+        # FM 的标准公式：dx/dt = v.
+        # 这里的路径是 x(t) = (1-t_local)x0 + t_local*x1
+        # dx/d(t_local) = x1 - x0
+        # dx/d(global_t) = (x1 - x0) * (d(t_local)/d(global_t))
+        #                = (x1 - x0) * (max_global_time / (t_end - t_start))
+        # 建议：直接让网络学习 dx/d(t_local)，即 segment 内的相对速度，这更容易学习。
+        # 但是在预测阶段，dt 步长需要调整。
+        # 为了简单起见，我们让网络学习 dx/d(t_local)，即每个时间段归一化为1的速度。
+        
+        v_spatial_true = c1 - c0
+        v_expression_true = e1 - e0
+        
+        # 质量增长 (log space)
+        # 如果是真实增长率，需要除以时间跨度。这里我们学的是 "每个 segment 归一化时间" 的变化量
+        growth_ratio = torch.tensor(target_mass_ratios[idx_0], dtype=torch.float32) # (B,)
+        # 修正 target ratios 维度
+        if growth_ratio.dim() == 1: growth_ratio = growth_ratio.unsqueeze(1)
+            
+        mass_rate_true = torch.log(growth_ratio + 1e-6) 
+        
+        # 6. Loss
+        loss_spatial = torch.mean(weights * (v_spatial_pred - v_spatial_true)**2)
+        loss_expr = torch.mean(weights * (v_expression_pred - v_expression_true)**2)
+        loss_mass = torch.mean(weights * (mass_rate_pred - mass_rate_true)**2)
+        
+        loss = lambda_spatial * loss_spatial + lambda_expr * loss_expr + lambda_mass * loss_mass
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # === 详细的损失函数打印 ===
+        if epoch % 100 == 0:
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch}/{epochs} (时间段 [{t_start}, {t_end}])")
+            print(f"{'='*60}")
+            print(f"总损失 (Total Loss):        {loss.item():.6f}")
+            print(f"  空间损失 (Spatial Loss):  {loss_spatial.item():.6f}")
+            print(f"  表达损失 (Expression):    {loss_expr.item():.6f}")
+            print(f"  质量损失 (Mass Loss):      {loss_mass.item():.6f}")
+            print(f"{'='*60}\n")
+            
+    return model
 
 # ==========================================
 # 5. 采样与预测
@@ -335,8 +521,9 @@ def train_model(
 def predict_evolution(
     model, 
     initial_cells,
-    t_start=0.0, 
-    t_end=1.0, 
+    start_abs_time,  # 起始绝对时间 (如 2.0)
+    target_abs_time,  # 目标绝对时间 (如 5.0)
+    max_global_time,  # 最大全局时间，用于归一化 (如 20.0)
     dt=0.05,
     threshold_proliferation=1.8,
     threshold_apoptosis=0.2
@@ -344,10 +531,10 @@ def predict_evolution(
     model.eval()
     current_cells = initial_cells.copy()
     
-    t = t_start
-    steps = int((t_end - t_start) / dt)
+    current_time = start_abs_time
+    steps = int((target_abs_time - start_abs_time) / dt)
     
-    print(f"Simulating evolution: t={t_start}->{t_end}, {len(current_cells)} start cells")
+    print(f"Simulating evolution: {start_abs_time} -> {target_abs_time}, {len(current_cells)} start cells")
     
     # 统计数据容器 (仅用于最后的总结)
     stats_history = {'n_cells': [], 'total_mass': []}
@@ -361,9 +548,12 @@ def predict_evolution(
             coords = torch.tensor(np.array([c['coords'] for c in current_cells]), dtype=torch.float32)
             expr = torch.tensor(np.array([c['expr'] for c in current_cells]), dtype=torch.float32)
             mass = torch.tensor(np.array([c['mass'] for c in current_cells]), dtype=torch.float32)
-            t_tensor = torch.ones(len(current_cells)) * t
             
-            v_s, v_e, m_rate = model(coords, expr, mass, t_tensor)
+            # 归一化绝对时间到 [0, 1] 区间
+            global_t_val = current_time / max_global_time
+            global_t_tensor = torch.ones(len(current_cells), 1) * global_t_val
+            
+            v_s, v_e, m_rate = model(coords, expr, mass, global_t_tensor)
             
             coords_new = coords + v_s * dt
             expr_new = expr + v_e * dt
@@ -404,7 +594,7 @@ def predict_evolution(
                     })
             
             current_cells = next_cells
-            t += dt
+            current_time += dt
             
             # 记录简要历史
             curr_mass_sum = sum(c['mass'] for c in current_cells)
@@ -418,22 +608,87 @@ def predict_evolution(
     print(f"Done. Final Cells: {len(current_cells)}, Growth Factor: {stats_history['total_mass'][-1]/stats_history['total_mass'][0]:.2f}x\n")
     return current_cells
 
+# ==========================================
+# 6. 主程序
+# ==========================================
 
-
-
-def main(input_t0_path, input_t1_path, output_path, target_time=0.66):
+def find_time_segment(time_points, target_time):
     """
-    原有的两个时间点插值函数（保持向后兼容）。
+    找到目标时间点所在的时间段。
+    
+    Args:
+        time_points: 已排序的时间点列表，例如 [2, 10, 15, 20]
+        target_time: 目标时间点，例如 5
+    
+    Returns:
+        (t_start, t_end): 目标时间点所在的时间段，例如 (2, 10)
+        如果目标时间点在所有已知时间点之前，返回 (None, min(time_points))
+        如果目标时间点在所有已知时间点之后，返回 (max(time_points), None)
     """
-    print("加载数据集 (t0, t1)...")
-    ad_t0 = sc.read_h5ad(input_t0_path)
-    ad_t1 = sc.read_h5ad(input_t1_path)
+    time_points = sorted(time_points)
     
-    # 预处理
-    ad_concat = ad.concat([ad_t0, ad_t1], label="batch", keys=["t0", "t1"])
-    c_all, e_all, m_all, ad_processed = preprocess_data(ad_concat, n_pca=50, n_top_genes=None)
+    if target_time <= time_points[0]:
+        return (None, time_points[0])
+    if target_time >= time_points[-1]:
+        return (time_points[-1], None)
     
-    # === 标准化 (关键修复) ===
+    for i in range(len(time_points) - 1):
+        if time_points[i] <= target_time <= time_points[i + 1]:
+            return (time_points[i], time_points[i + 1])
+    
+    # 理论上不会到达这里
+    return (time_points[0], time_points[-1])
+
+
+def main_multi_time(input_files_dict, output_path, target_time, epochs=2000):
+    """
+    支持多个时间点的插值预测。
+    
+    Args:
+        input_files_dict: 字典，键为时间点（数字），值为文件路径，例如 {2: "data/day2.h5ad", 10: "data/day10.h5ad", ...}
+        output_path: 输出文件路径
+        target_time: 目标时间点（实际时间，例如 5）
+        epochs: 训练轮数
+    """
+    print(f"加载多个时间点的数据: {sorted(input_files_dict.keys())}")
+    print(f"目标时间点: {target_time}")
+    
+    time_points = sorted(input_files_dict.keys())
+    
+    # 找到目标时间点所在的时间段
+    t_start, t_end = find_time_segment(time_points, target_time)
+    
+    if t_start is None:
+        print(f"警告: 目标时间 {target_time} 在所有已知时间点之前，使用第一个时间点 {t_end} 作为起始点")
+        t_start = t_end
+    elif t_end is None:
+        print(f"警告: 目标时间 {target_time} 在所有已知时间点之后，使用最后一个时间点 {t_start} 作为起始点")
+        t_end = t_start
+    
+   
+    # 使用所有相邻时间段
+    training_segments = []
+    for i in range(len(time_points) - 1):
+        seg_start = time_points[i]
+        seg_end = time_points[i + 1]
+        training_segments.append((seg_start, seg_end))
+    print(f"使用所有相邻时间段进行联合训练: {training_segments}")
+  
+    
+    # 加载所有需要的时间点数据
+    all_adata = {}
+    for time_point in time_points:
+        file_path = input_files_dict[time_point]
+        print(f"加载时间点 {time_point}: {file_path}")
+        all_adata[time_point] = sc.read_h5ad(file_path)
+    
+    # 预处理所有数据（统一标准化）
+    print("预处理所有时间点数据...")
+    ad_list = [all_adata[tp] for tp in time_points]
+    ad_concat_all = ad.concat(ad_list, label="time_point", keys=[str(tp) for tp in time_points])
+    c_all, e_all, m_all, ad_processed = preprocess_data(ad_concat_all, n_pca=50, n_top_genes=None)
+    
+    # 全局标准化（使用所有时间点的数据）
     e_mean, e_std = np.mean(e_all, axis=0), np.std(e_all, axis=0) + 1e-6
     e_all_norm = (e_all - e_mean) / e_std
     
@@ -442,31 +697,92 @@ def main(input_t0_path, input_t1_path, output_path, target_time=0.66):
     
     scalers = {'e_mean': e_mean, 'e_std': e_std, 'c_mean': c_mean, 'c_std': c_std}
     
-    n0 = ad_t0.n_obs
-    coords_0, expr_0, mass_0 = c_all_norm[:n0], e_all_norm[:n0], m_all[:n0]
-    coords_1, expr_1, mass_1 = c_all_norm[n0:], e_all_norm[n0:], m_all[n0:]
+    # 为每个时间段准备数据
+    segments_data = []
+    cum_n_obs = 0
+    time_point_indices = {}
+    for tp in time_points:
+        time_point_indices[tp] = (cum_n_obs, cum_n_obs + all_adata[tp].n_obs)
+        cum_n_obs += all_adata[tp].n_obs
     
-    print(f"t0: {len(coords_0)} cells, t1: {len(coords_1)} cells")
-    
-    # 计算 OT
-    ot_matrix = compute_unbalanced_ot(coords_0, expr_0, coords_1, expr_1, mass_0, mass_1, tau=0.8)
-    
-    # 训练
-    model = MassFlowMatching(coord_dim=coords_0.shape[1], expression_dim=expr_0.shape[1])
-    model = train_model(model, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix, epochs=2000)
-    
-    # 预测
-    initial_state = []
-    obs_indices = ad_t0.obs_names
-    for i in range(n0):
-        initial_state.append({
-            'coords': coords_0[i], 'expr': expr_0[i], 'mass': mass_0[i], 'id': obs_indices[i]
-        })
+    for seg_start, seg_end in training_segments:
+        start_idx, end_idx = time_point_indices[seg_start]
+        seg_start_coords = c_all_norm[start_idx:end_idx]
+        seg_start_expr = e_all_norm[start_idx:end_idx]
+        seg_start_mass = m_all[start_idx:end_idx]
         
-    predicted_cells = predict_evolution(model, initial_state, t_start=0.0, t_end=target_time, dt=0.05)
+        start_idx, end_idx = time_point_indices[seg_end]
+        seg_end_coords = c_all_norm[start_idx:end_idx]
+        seg_end_expr = e_all_norm[start_idx:end_idx]
+        seg_end_mass = m_all[start_idx:end_idx]
+        
+        print(f"计算时间段 [{seg_start}, {seg_end}] 的 OT 矩阵...")
+        ot_matrix = compute_unbalanced_ot(
+            seg_start_coords, seg_start_expr, 
+            seg_end_coords, seg_end_expr,
+            seg_start_mass, seg_end_mass, tau=0.8
+        )
+        
+        segments_data.append((
+            seg_start, seg_end,
+            seg_start_coords, seg_start_expr, seg_start_mass,
+            seg_end_coords, seg_end_expr, seg_end_mass,
+            ot_matrix
+        ))
+    
+    # 训练模型
+    coord_dim = segments_data[0][2].shape[1]
+    expression_dim = segments_data[0][3].shape[1]
+    model = MassFlowMatching(coord_dim=coord_dim, expression_dim=expression_dim)
+    
+    if len(segments_data) > 1:
+        # 多时间段联合训练
+        # 给目标时间段更高的权重
+        segment_weights = []
+        for seg_start, seg_end in training_segments:
+            if seg_start == t_start and seg_end == t_end:
+                segment_weights.append(2.0)  # 目标时间段权重更高
+            else:
+                segment_weights.append(1.0)
+        # 确定最大时间用于归一化
+        max_global_time = max(time_points)
+        
+        model = train_model_multi_segments(
+            model, segments_data, max_global_time, epochs=epochs,
+            segment_weights=segment_weights
+        )
+    else:
+        # 单时间段训练
+        seg_start, seg_end, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix = segments_data[0]
+        max_global_time = max(time_points)
+        model = train_model(model, coords_0, expr_0, mass_0, coords_1, expr_1, mass_1, ot_matrix, 
+                           seg_start, seg_end, max_global_time, epochs=epochs)
+    
+    print(f"目标时间: {target_time} (时间段: [{t_start}, {t_end}])")
+    
+    # 使用目标时间段的起始点进行预测
+    start_idx, end_idx = time_point_indices[t_start]
+    initial_state = []
+    obs_indices = all_adata[t_start].obs_names
+    for i in range(end_idx - start_idx):
+        initial_state.append({
+            'coords': c_all_norm[start_idx + i], 
+            'expr': e_all_norm[start_idx + i], 
+            'mass': m_all[start_idx + i], 
+            'id': obs_indices[i]
+        })
+    
+    # 使用绝对时间进行预测
+    predicted_cells = predict_evolution(
+        model, initial_state, 
+        start_abs_time=t_start,  # 起始绝对时间
+        target_abs_time=target_time,  # 目标绝对时间
+        max_global_time=max_global_time,  # 最大全局时间
+        dt=0.05
+    )
     
     # 重构输出 (反标准化)
-    print("Reconstructing AnnData...")
+    print("重构 AnnData...")
     pred_expr_norm = np.array([c['expr'] for c in predicted_cells])
     pred_coords_norm = np.array([c['coords'] for c in predicted_cells])
     
@@ -484,26 +800,60 @@ def main(input_t0_path, input_t1_path, output_path, target_time=0.66):
     ad_pred.obs['mass'] = pred_mass
     ad_pred.obs_names = pred_ids
     ad_pred.obs['predicted_time'] = target_time
+    ad_pred.obs['time_segment_start'] = t_start
+    ad_pred.obs['time_segment_end'] = t_end
     
-    print(f"Saving prediction to {output_path}")
+    print(f"保存预测结果到 {output_path}")
     ad_pred.write_h5ad(output_path)
-    print("Done.")
+    print("完成。")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Mass-Flow-Matching Trajectory Inference",
+        description="Mass-Flow-Matching Trajectory Inference (多时间点联合训练)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例用法:
+
+使用所有相邻时间段联合训练:
+   python main.py --multi_time 2:data/day2.h5ad,10:data/day10.h5ad,15:data/day15.h5ad,20:data/day20.h5ad --target_time 5 --output data/day5_pred.h5ad
+
+如果只想使用目标时间段，只输入目标时间段对应的两个时间点即可:
+   python main.py --multi_time 2:data/day2.h5ad,10:data/day10.h5ad --target_time 5 --output data/day5_pred.h5ad
+
+   格式: --multi_time "时间点1:文件路径1,时间点2:文件路径2,..."
+   
+   说明:
+   - 使用所有相邻时间段进行联合训练（如 [2,10], [10,15], [15,20]），
+     这有助于学习更通用的动力学规律，提升预测效果
+   - 如果只提供两个时间点，则只训练该时间段
+        """
     )
     
-    # 两种模式：原有的两个时间点模式，或新的多时间点模式
-    parser.add_argument("--input_t0", type=str, help="Path to start-time (t0) h5ad (两时间点模式)")
-    parser.add_argument("--input_t1", type=str, help="Path to end-time (t1) h5ad (两时间点模式)")
+    parser.add_argument("--multi_time", type=str, required=True, 
+                       help="多时间点输入: '时间点1:文件路径1,时间点2:文件路径2,...' 例如: '2:data/day2.h5ad,10:data/day10.h5ad'")
+    parser.add_argument("--target_time", type=float, required=True, 
+                       help="目标时间点（实际时间，例如 5 表示 day 5）")
     parser.add_argument("--output", type=str, required=True, help="Path to save predicted h5ad")
-    parser.add_argument("--time", type=float, default=0.66, help="Target interpolation time (0.0-1.0, 仅用于两时间点模式)")
-    parser.add_argument("--epochs", type=int, default=2000, help="训练轮数")
-    parser.add_argument("--use_all_segments", action="store_true", 
-                       help="使用所有相邻时间段进行联合训练（可能提升预测效果，但需要更多计算）。默认只使用目标时间段。")
+    parser.add_argument("--epochs", type=int, default=500, help="训练轮数")
     
     args = parser.parse_args()
-        
-    main(args.input_t0, args.input_t1, args.output, args.time)
+    
+    # 解析多时间点输入
+    input_files_dict = {}
+    try:
+        pairs = args.multi_time.split(',')
+        for pair in pairs:
+            time_str, file_path = pair.split(':', 1)
+            time_point = float(time_str.strip())
+            file_path = file_path.strip()
+            input_files_dict[time_point] = file_path
+    except ValueError as e:
+        parser.error(f"解析 --multi_time 参数失败: {e}. 格式应为 '时间点1:文件路径1,时间点2:文件路径2,...'")
+    
+    if len(input_files_dict) < 2:
+        parser.error("至少需要2个时间点")
+    
+    # 始终使用所有相邻时间段进行联合训练（如果只有两个时间点，就只有一个时间段）
+    main_multi_time(input_files_dict, args.output, args.target_time, 
+                   epochs=args.epochs)
