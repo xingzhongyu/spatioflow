@@ -9,8 +9,8 @@ print(origin_adata)
 unique_annotations = origin_adata.obs['Annotation'].unique()
 adata.obs['Annotation'] = np.random.choice(unique_annotations, size=len(adata), replace=True)
 # sc.pl.spatial expects the coordinate key via `basis` (default "spatial")
-sc.pl.spatial(adata, basis="spatial", save=f"day{day}_pred.png", spot_size=20, color='Annotation',palette=['blue'], 
+sc.pl.spatial(adata, basis="spatial", save=f"day{day}_pred.png", spot_size=20, color='Annotation',palette=["blue"], 
                alpha=1.0, frameon=False)
-sc.pl.spatial(origin_adata, basis="spatial", save=f"day{day}.png", spot_size=20, color='Annotation',palette=['blue'], 
+sc.pl.spatial(origin_adata, basis="spatial", save=f"day{day}.png", spot_size=20, color='Annotation',palette=["blue"], 
                alpha=1.0, frameon=False)
 
