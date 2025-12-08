@@ -19,13 +19,16 @@ from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
-
+import hashlib
+import pickle
 # JAX for Optimal Transport
-import jax
-import jax.numpy as jnp
-from ott.geometry import geometry
-from ott.problems.linear import linear_problem
-from ott.solvers.linear import sinkhorn
+# import jax
+# import jax.numpy as jnp
+# from ott.geometry import geometry
+# from ott.problems.linear import linear_problem
+# from ott.solvers.linear import sinkhorn
+import paste2
+from paste2 import PASTE2, projection
 
 # 设置随机种子
 torch.manual_seed(42)
@@ -87,10 +90,14 @@ def calculate_benchmark_metrics(pred_adata, gt_adata, scalers, w=0.9):
 # ==========================================
 # 2. 数据预处理与加载 (保持不变)
 # ==========================================
-def preprocess_multislice(adata_list, time_points, n_top_genes=2000, n_pca=50, use_spatial_split=False,use_pca=False):
+def preprocess_multislice(adata_list, time_points, n_top_genes=2000, n_pca=50, use_spatial_split=False, 
+                          use_pca=False, file_paths=None, use_cache=True):
     """处理多个切片，统一进行 PCA 和标准化。"""
     print("Concatenating all datasets for global normalization...")
-    adata_list = align_spatial_slices(adata_list, time_points)
+    adata_list, pi_list = align_spatial_slices_and_get_pi(
+        adata_list, time_points, overlap=0.7, visualize=True, 
+        file_paths=file_paths, alpha=0.1, use_cache=use_cache
+    )
     for adata, t in zip(adata_list, time_points):
         adata.obs['time_point'] = t
         
@@ -145,355 +152,729 @@ def preprocess_multislice(adata_list, time_points, n_top_genes=2000, n_pca=50, u
             'n_cells': n
         }
         start_idx += n
+    ot_matrices_dict = {}
+    for i in range(len(time_points) - 1):
+        t_start = time_points[i]
+        # 存起来，之后直接用
+        ot_matrices_dict[t_start] = pi_list[i]
         
-    return processed_data_dict, scalers,feat_dim
+    return processed_data_dict, scalers,feat_dim,ot_matrices_dict
 
+# # ==========================================
+# # 3. OT 计算辅助函数
+# # ==========================================
+# def _pairwise_squared_distances(x, y):
+#     x_sq = jnp.sum(jnp.square(x), axis=1, keepdims=True)
+#     y_sq = jnp.sum(jnp.square(y), axis=1)
+#     distances = x_sq + y_sq - 2.0 * jnp.matmul(x, y.T)
+#     return jnp.maximum(distances, 0.0)
 # ==========================================
-# 3. OT 计算辅助函数
+# 新增：缓存机制辅助函数
 # ==========================================
-def _pairwise_squared_distances(x, y):
-    x_sq = jnp.sum(jnp.square(x), axis=1, keepdims=True)
-    y_sq = jnp.sum(jnp.square(y), axis=1)
-    distances = x_sq + y_sq - 2.0 * jnp.matmul(x, y.T)
-    return jnp.maximum(distances, 0.0)
+def get_cache_key(file_paths, time_points, overlap, alpha):
+    """
+    生成缓存键，基于文件路径、时间点和参数。
+    
+    Parameters:
+    -----------
+    file_paths : list of str
+        文件路径列表
+    time_points : list of float
+        时间点列表
+    overlap : float
+        PASTE2 的 overlap 参数
+    alpha : float
+        PASTE2 的 alpha 参数
+    
+    Returns:
+    --------
+    cache_key : str
+        缓存键字符串
+    """
+    # 组合所有信息
+    info_str = f"{file_paths}_{time_points}_{overlap}_{alpha}"
+    # 使用 MD5 生成短哈希
+    cache_key = hashlib.md5(info_str.encode()).hexdigest()
+    return cache_key
+
+def get_cache_path(cache_key, cache_dir="cache"):
+    """
+    获取缓存文件路径。
+    
+    Parameters:
+    -----------
+    cache_key : str
+        缓存键
+    cache_dir : str
+        缓存目录
+    
+    Returns:
+    --------
+    cache_path : str
+        缓存文件路径
+    """
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    return os.path.join(cache_dir, f"paste2_pi_{cache_key}.pkl")
+
+def load_pi_cache(file_paths, time_points, overlap, alpha, cache_dir="cache"):
+    """
+    尝试从缓存加载 pi 矩阵列表。
+    
+    Parameters:
+    -----------
+    file_paths : list of str
+        文件路径列表
+    time_points : list of float
+        时间点列表
+    overlap : float
+        PASTE2 的 overlap 参数
+    alpha : float
+        PASTE2 的 alpha 参数
+    cache_dir : str
+        缓存目录
+    
+    Returns:
+    --------
+    pi_list : list of np.ndarray or None
+        如果缓存存在，返回 pi 矩阵列表；否则返回 None
+    """
+    cache_key = get_cache_key(file_paths, time_points, overlap, alpha)
+    cache_path = get_cache_path(cache_key, cache_dir)
+    
+    if os.path.exists(cache_path):
+        try:
+            print(f"  [Cache] Loading PASTE2 pi matrices from cache: {cache_path}")
+            with open(cache_path, 'rb') as f:
+                pi_list = pickle.load(f)
+            print(f"  [Cache] Successfully loaded {len(pi_list)} pi matrices from cache")
+            return pi_list
+        except Exception as e:
+            print(f"  [Cache] Warning: Failed to load cache: {e}")
+            return None
+    return None
+
+def save_pi_cache(pi_list, file_paths, time_points, overlap, alpha, cache_dir="cache"):
+    """
+    保存 pi 矩阵列表到缓存。
+    
+    Parameters:
+    -----------
+    pi_list : list of np.ndarray
+        pi 矩阵列表
+    file_paths : list of str
+        文件路径列表
+    time_points : list of float
+        时间点列表
+    overlap : float
+        PASTE2 的 overlap 参数
+    alpha : float
+        PASTE2 的 alpha 参数
+    cache_dir : str
+        缓存目录
+    """
+    cache_key = get_cache_key(file_paths, time_points, overlap, alpha)
+    cache_path = get_cache_path(cache_key, cache_dir)
+    
+    try:
+        with open(cache_path, 'wb') as f:
+            pickle.dump(pi_list, f)
+        print(f"  [Cache] Saved {len(pi_list)} pi matrices to cache: {cache_path}")
+    except Exception as e:
+        print(f"  [Cache] Warning: Failed to save cache: {e}")
+
 # ==========================================
 # 新增：空间对齐辅助函数
 # ==========================================
-def align_spatial_slices(adata_list, time_points):
- 
-    print("Aligning spatial coordinates across slices...")
-    
-    aligned_coords_list = []
-    
-    for i, adata in enumerate(adata_list):
-        coords = adata.obsm['spatial'].copy()
-        
-        # Center
-        c_mean = np.mean(coords, axis=0)
-        coords = coords - c_mean
-        
-        scale = np.max(np.std(coords, axis=0)) + 1e-8
-        coords = coords / scale
-        
-        adata.obsm['spatial_aligned'] = coords # 暂存
-    
-    
-    for i in range(len(adata_list)):
-        coords = adata_list[i].obsm['spatial_aligned']
-        
-        pca =  KMeans(n_clusters=1, n_init=1, max_iter=1).fit(coords) # 只是为了拿到中心，其实已经是0了
-        u, s, vh = np.linalg.svd(coords.T @ coords)
-        
-        angle = np.arctan2(vh[0, 1], vh[0, 0])
-        R = np.array([
-            [np.cos(-angle), -np.sin(-angle)],
-            [np.sin(-angle),  np.cos(-angle)]
-        ])
-        coords_rotated = coords @ R.T
-        
-        if i > 0:
-            prev_coords = adata_list[i-1].obsm['spatial_aligned']
-            
-            
-            best_coords = coords_rotated
-            min_dist = np.inf
-            
-            # 测试 4 种翻转: (x,y), (-x,y), (x,-y), (-x,-y)
-            transforms = [
-                np.array([1, 1]), np.array([-1, 1]), 
-                np.array([1, -1]), np.array([-1, -1])
-            ]
-            
-            n_sub = min(500, coords_rotated.shape[0], prev_coords.shape[0])
-            idx_curr = np.random.choice(coords_rotated.shape[0], n_sub, replace=False)
-            idx_prev = np.random.choice(prev_coords.shape[0], n_sub, replace=False)
-            sub_curr = coords_rotated[idx_curr]
-            sub_prev = prev_coords[idx_prev]
-            
-            for t_scale in transforms:
-                temp_coords = sub_curr * t_scale
-                d_matrix = cdist(temp_coords, sub_prev)
-                chamfer_dist = np.mean(np.min(d_matrix, axis=1)) + np.mean(np.min(d_matrix, axis=0))
-                
-                if chamfer_dist < min_dist:
-                    min_dist = chamfer_dist
-                    best_transform = t_scale
-            
-            coords_rotated = coords_rotated * best_transform
-            
-        adata_list[i].obsm['spatial_aligned'] = coords_rotated
-        print(f"  Slice t={time_points[i]}: Aligned. (std={np.std(coords_rotated):.3f})")
-    return adata_list
-def visualize_geodesic_pairing(coords1, coords2, cross_graph, dist_geo, ot_matrix=None, save_path=None):
+def visualize_paste_alignment(source_adata, target_adata, pi, t_curr, t_next, save_dir="alignment_vis"):
     """
-    可视化测地线配对关系 (修改版：加入人工平移以解决坐标重叠问题)
+    可视化 PASTE2 的对齐结果。
+    包含两张子图：
+    1. Overlay: 对齐后的坐标叠加，检查几何吻合度。
+    2. Connections: 将两切片左右分开，画出 PASTE2 权重最高的连线，检查匹配逻辑。
     """
-    fig = plt.figure(figsize=(20, 5))
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    # 获取对齐后的坐标
+    # 注意：确保传入的 adata 已经包含 'spatial_aligned'
+    X = source_adata.obsm['spatial_aligned']
+    Y = target_adata.obsm['spatial_aligned']
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     
-    # 1. 计算平移偏移量 (Shift)
-    # 获取 coords1 的 X 轴范围
-    x_min, x_max = np.min(coords1[:, 0]), np.max(coords1[:, 0])
-    width = x_max - x_min
-    if width == 0: width = 1.0
+    # === Subplot 1: Geometry Overlay (检查对齐) ===
+    ax1 = axes[0]
+    ax1.scatter(X[:, 0], X[:, 1], c='red', s=10, alpha=0.4, label=f't={t_curr}', edgecolors='none')
+    ax1.scatter(Y[:, 0], Y[:, 1], c='blue', s=10, alpha=0.4, label=f't={t_next} (Aligned)', edgecolors='none')
+    ax1.set_title(f"Spatial Alignment Overlay\n(t={t_curr} vs t={t_next})")
+    ax1.legend()
+    ax1.axis('equal') # 保持比例，这对检查空间对齐很重要
+
+    # === Subplot 2: Matching Logic (检查 PASTE2 匹配) ===
+    # 为了看清连线，我们将 Y 向右平移
+    ax2 = axes[1]
     
-    # 设置偏移量，让 Target 显示在 Source 的右侧，中间留一点空隙
-    shift_x = width * 1.5
+    x_range = np.max(X[:, 0]) - np.min(X[:, 0])
+    shift = x_range * 1.5
+    Y_shifted = Y.copy()
+    Y_shifted[:, 0] += shift
     
-    # 创建用于绘图的 Target 坐标副本
-    coords2_vis = coords2.copy()
-    coords2_vis[:, 0] += shift_x
+    ax2.scatter(X[:, 0], X[:, 1], c='red', s=5, alpha=0.3)
+    ax2.scatter(Y_shifted[:, 0], Y_shifted[:, 1], c='blue', s=5, alpha=0.3)
     
-    # =========================================
-    # 子图1: 空间分布 + Cross Graph 连接
-    # =========================================
-    ax1 = plt.subplot(1, 4, 1)
+    # 随机抽样一些 Source 细胞画连线，避免线太密
+    n_source = X.shape[0]
+    n_lines = min(200, n_source)
+    sample_indices = np.random.choice(n_source, n_lines, replace=False)
     
-    # 画点
-    ax1.scatter(coords1[:, 0], coords1[:, 1], c='red', s=10, alpha=0.5, label='Source (t)', marker='o', edgecolors='none')
-    ax1.scatter(coords2_vis[:, 0], coords2_vis[:, 1], c='blue', s=10, alpha=0.5, label='Target (t+1)', marker='s', edgecolors='none')
-    
-    # 标注 Time Point
-    ax1.text(np.mean(coords1[:, 0]), np.max(coords1[:, 1]) + width*0.1, "Time t", ha='center', fontsize=10, fontweight='bold')
-    ax1.text(np.mean(coords2_vis[:, 0]), np.max(coords2_vis[:, 1]) + width*0.1, "Time t+1", ha='center', fontsize=10, fontweight='bold')
-    
-    # 绘制 cross_graph 连接 (Geodesic 构建时的临近连接)
-    # 为了避免太乱，只显示部分点的连接
-    n1 = coords1.shape[0]
-    n_show = min(100, n1)
-    indices_to_show = np.linspace(0, n1-1, n_show, dtype=int)
-    
-    # 获取稀疏矩阵的连接关系
-    # cross_graph 是 [N1, N2] 的稀疏矩阵
-    # 我们需要找到非零元素
-    
-    cx = cross_graph.tocsr() # 转为 CSR 加速切片
-    
-    for i in indices_to_show:
-        # 找到第 i 个 Source 点连接的所有 Target 点
-        # cross_graph[i, :] 非零的索引
-        row = cx.getrow(i)
-        target_indices = row.indices # 连接到的 Target 索引
-        
-        for j in target_indices:
-            ax1.plot([coords1[i, 0], coords2_vis[j, 0]], 
-                    [coords1[i, 1], coords2_vis[j, 1]], 
-                    'g-', alpha=0.2, linewidth=0.5)
-    
-    ax1.set_title('Geodesic Graph Construction\n(Green lines = Cross Neighbors)', fontsize=10)
-    ax1.legend(loc='lower right', fontsize=8)
-    ax1.axis('off') #以此模式通常不需要坐标轴刻度
-    
-    # =========================================
-    # 子图2: 测地线距离矩阵热力图 (不变)
-    # =========================================
-    ax2 = plt.subplot(1, 4, 2)
-    n_show1 = min(200, dist_geo.shape[0])
-    n_show2 = min(200, dist_geo.shape[1])
-    # 这里的距离是真实的测地线距离，不需要平移
-    im = ax2.imshow(dist_geo[:n_show1, :n_show2], aspect='auto', cmap='viridis', origin='lower')
-    ax2.set_title('Geodesic Distance Matrix\n(Subset)', fontsize=10)
-    ax2.set_xlabel('Target Index')
-    ax2.set_ylabel('Source Index')
-    plt.colorbar(im, ax=ax2, label='Distance')
-    
-    # =========================================
-    # 子图3: OT 配对关系 (应用平移)
-    # =========================================
-    ax3 = plt.subplot(1, 4, 3)
-    if ot_matrix is not None:
-        # 画点
-        ax3.scatter(coords1[:, 0], coords1[:, 1], c='red', s=10, alpha=0.5, marker='o', edgecolors='none')
-        ax3.scatter(coords2_vis[:, 0], coords2_vis[:, 1], c='blue', s=10, alpha=0.5, marker='s', edgecolors='none')
-        
-        # 找到主要配对
-        # 这里的 OT Matrix 通常比较稠密(entropic)，我们只画权重最高的连线
-        
-        # 策略：对于每个 Source 点，画出权重最大的那个 Target 连接
-        # 为了避免画几千条线，我们只随机采样一些 Source 点
-        n_lines_show = 150
-        sample_indices = np.random.choice(ot_matrix.shape[0], min(n_lines_show, ot_matrix.shape[0]), replace=False)
-        
-        for i in sample_indices:
-            # 找到该行最大的权重的列索引 (argmax)
-            j = np.argmax(ot_matrix[i, :])
-            weight = ot_matrix[i, j]
+    # pi 可能非常稀疏，我们需要找到每个采样细胞最强的匹配目标
+    # 确保 pi 是 numpy 数组
+    if not isinstance(pi, np.ndarray):
+        pi = np.array(pi)
+
+    for i in sample_indices:
+        # 找到该行权重最大的列索引
+        row = pi[i, :]
+        if np.sum(row) > 1e-9: # 如果该细胞没有“完全凋亡”
+            j = np.argmax(row)
+            # 只有当匹配权重占该行总权重的比例够高时才画（可选过滤）
+            ax2.plot([X[i, 0], Y_shifted[j, 0]], 
+                     [X[i, 1], Y_shifted[j, 1]], 
+                     c='green', alpha=0.3, linewidth=0.5)
             
-            # 只有当权重足够大时才画 (相对值)
-            if weight > 1e-8:
-                ax3.plot([coords1[i, 0], coords2_vis[j, 0]], 
-                        [coords1[i, 1], coords2_vis[j, 1]], 
-                        'purple', alpha=0.4, linewidth=0.8)
-        
-        ax3.set_title(f'Optimal Transport Map\n(Top-1 connection for random {min(n_lines_show, ot_matrix.shape[0])} cells)', fontsize=10)
-    else:
-        ax3.text(0.5, 0.5, 'No OT Matrix', ha='center', va='center')
-        
-    ax3.axis('off')
-    
-    # =========================================
-    # 子图4: OT 矩阵热力图 (不变)
-    # =========================================
-    ax4 = plt.subplot(1, 4, 4)
-    if ot_matrix is not None:
-        n_show1 = min(200, ot_matrix.shape[0])
-        n_show2 = min(200, ot_matrix.shape[1])
-        im = ax4.imshow(ot_matrix[:n_show1, :n_show2], aspect='auto', cmap='magma', origin='lower')
-        ax4.set_title('OT Coupling Matrix\n(Subset)', fontsize=10)
-        ax4.set_xlabel('Target Index')
-        ax4.set_ylabel('Source Index')
-        plt.colorbar(im, ax=ax4, label='Probability')
-    else:
-        ax4.text(0.5, 0.5, 'No OT Matrix', ha='center', va='center')
-    
+    ax2.set_title("PASTE2 Matching Connections\n(Top-1 match for random subset)")
+    ax2.text(np.mean(X[:, 0]), np.min(X[:, 1]) - x_range*0.1, f"t={t_curr}", ha='center', fontweight='bold')
+    ax2.text(np.mean(Y_shifted[:, 0]), np.min(Y_shifted[:, 1]) - x_range*0.1, f"t={t_next}", ha='center', fontweight='bold')
+    ax2.axis('off')
+
+    save_path = os.path.join(save_dir, f"align_{t_curr}_to_{t_next}.png")
     plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"    [Visual] Saved alignment check to {save_path}")
     
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  [Visual] Saved OT visualization to: {save_path}")
-    else:
-        plt.show()
-    
-    plt.close(fig)
-
-def compute_geodesic_cost_matrix(coords1, coords2, n_neighbors=15, n_cross_neighbors=5, return_intermediate=False):
+def align_spatial_slices_and_get_pi(adata_list, time_points, overlap=0.9, visualize=True, 
+                                    file_paths=None, alpha=0.1, cache_dir="cache", use_cache=True):
     """
-    计算测地线距离，并强制保证 Source 和 Target 之间的连通性。
+    使用 PASTE2 对齐坐标，并返回计算出的 Partial OT 矩阵 (pi)。
+    使用 projection.partial_stack_slices_pairwise() 将所有切片投影到同一坐标系。
     
     Parameters:
     -----------
-    coords1 : np.ndarray
-        Source 点集坐标
-    coords2 : np.ndarray
-        Target 点集坐标
-    n_neighbors : int
-        每个点集内部的邻居数
-    n_cross_neighbors : int
-        跨集连接的邻居数
-    return_intermediate : bool
-        是否返回中间结果（cross_graph, dist_geo）用于可视化
-    
-    Returns:
-    --------
-    result : np.ndarray
-        测地线距离矩阵的平方 [N1, N2]
-    (cross_graph, dist_geo) : tuple, optional
-        如果 return_intermediate=True，返回中间结果
-    """
-    n1 = coords1.shape[0]
-    n2 = coords2.shape[0]
-    
-    g1 = kneighbors_graph(coords1, n_neighbors=n_neighbors, mode='distance', include_self=False)
-    g2 = kneighbors_graph(coords2, n_neighbors=n_neighbors, mode='distance', include_self=False)
-    
-    nbrs_cross = NearestNeighbors(n_neighbors=n_cross_neighbors, algorithm='auto').fit(coords2)
-    distances_cross, indices_cross = nbrs_cross.kneighbors(coords1)
-    
-    cross_graph = lil_matrix((n1, n2))
-    
-
-    for i in range(n1):
-        for k in range(n_cross_neighbors):
-            j = indices_cross[i, k]
-            d = distances_cross[i, k]
-            cross_graph[i, j] = d
-            
-    from scipy.sparse import bmat
-    combined_graph = bmat([
-        [g1, cross_graph], 
-        [cross_graph.T, g2]
-    ])
-    
-    dist_matrix_all = shortest_path(csgraph=combined_graph, directed=False, return_predecessors=False)
-    dist_geo = dist_matrix_all[:n1, n1:]
-    finite_mask = np.isfinite(dist_geo)
-    if not np.any(finite_mask):
-        print(" [Warning] Geodesic graph still totally disconnected! Fallback to Euclidean.")
-        result = cdist(coords1, coords2, metric='sqeuclidean')
-        if return_intermediate:
-            return result, (None, None)
-        return result
-    
-    max_dist = np.max(dist_geo[finite_mask])
-    dist_geo[~finite_mask] = max_dist * 1.5
-    result = dist_geo ** 2
-    
-    if return_intermediate:
-        return result, (cross_graph, dist_geo)
-    return result
-def compute_unbalanced_ot(d0, d1, tau=0.8, epsilon=0.05, lambda_type=0.0, use_geodesic=False, visualize=False, save_path=None):
-    """
-    封装 OT 计算
-    
-    Parameters:
-    -----------
-    d0 : dict
-        Source 数据字典，包含 'coords', 'expr', 'type_onehot', 'mass'
-    d1 : dict
-        Target 数据字典，包含 'coords', 'expr', 'type_onehot', 'mass'
-    tau : float
-        Unbalanced OT 参数
-    epsilon : float
-        Sinkhorn 正则化参数
-    lambda_type : float
-        类型约束权重
-    use_geodesic : bool
-        是否使用测地线距离
+    adata_list : list of AnnData
+        切片数据列表
+    time_points : list of float
+        时间点列表
+    overlap : float
+        PASTE2 的核心参数 's'。
+        表示预计两个切片之间的重叠比例 (0 < s <= 1)。
+        s=1.0 近似于标准 OT (质量守恒)。
+        s=0.8 表示允许 20% 的不匹配 (模拟增殖/凋亡/视野移位)。
     visualize : bool
-        是否进行可视化
-    save_path : str, optional
-        可视化保存路径
-    
-    Returns:
-    --------
-    ot_matrix : np.ndarray
-        最优传输矩阵 [N1, N2]
+        是否可视化对齐结果
+    file_paths : list of str, optional
+        文件路径列表，用于生成缓存键。如果为 None，则不使用缓存。
+    alpha : float
+        PASTE2 的 alpha 参数，权衡基因表达和空间结构
+    cache_dir : str
+        缓存目录
+    use_cache : bool
+        是否使用缓存机制
     """
-    coords_x, coords_y = jnp.array(d0['coords']), jnp.array(d1['coords'])
-    coords_x_np,coords_y_np=np.array(d0['coords']),np.array(d1['coords'])
+    print(f"Aligning spatial slices using PASTE2 (Partial Alignment, overlap s={overlap})...")
     
-    expr_x, expr_y = jnp.array(d0['expr']), jnp.array(d1['expr'])
-    type_x, type_y = jnp.array(d0['type_onehot']), jnp.array(d1['type_onehot'])
+    # 创建副本用于计算 PASTE（预处理已在 preprocess_multislice 中完成）
+    # 无论是否使用缓存，都需要副本用于后续的投影操作
+    adata_list_copy = [ad.copy() for ad in adata_list]
     
-    cross_graph = None
-    dist_geo = None
+    # 尝试从缓存加载
+    pi_list = None
+    if use_cache and file_paths is not None:
+        pi_list = load_pi_cache(file_paths, time_points, overlap, alpha, cache_dir)
     
-    if use_geodesic:
-        if visualize:
-            dist_c_np, (cross_graph, dist_geo) = compute_geodesic_cost_matrix(
-                coords_x_np, coords_y_np, n_neighbors=15, return_intermediate=True)
-        else:
-            dist_c_np = compute_geodesic_cost_matrix(coords_x_np, coords_y_np, n_neighbors=15)
-        dist_c = jnp.array(dist_c_np)
-    else:
-        coords_x, coords_y = jnp.array(coords_x_np), jnp.array(coords_y_np)
-        dist_c = _pairwise_squared_distances(coords_x, coords_y)
-    dist_e = _pairwise_squared_distances(expr_x, expr_y)
-    
-    similarity_matrix = jnp.matmul(type_x, type_y.T)
-    dist_type = 1.0 - similarity_matrix
-    mean_c = jnp.mean(dist_c) + 1e-8
-    mean_e = jnp.mean(dist_e) + 1e-8
-    cost = (dist_c / mean_c) + (dist_e / mean_e) + lambda_type * dist_type
-    # raw_cost = dist_c + dist_e + lambda_type * dist_type
-    # scale_factor = jnp.mean(raw_cost) + 1e-8
-    # cost = raw_cost / scale_factor
+    # 如果缓存不存在，需要计算
+    if pi_list is None:
+        print(f"  [Cache] Cache not found, computing PASTE2 alignments...")
+        pi_list = [] 
+        
+        # ==================================================
+        # 步骤 1: 计算所有相邻切片之间的 PASTE2 对齐矩阵
+        # ==================================================
+        for i in range(len(adata_list) - 1):
+            t_curr = time_points[i]
+            t_next = time_points[i+1]
+            print(f"  Calculating PASTE2 mapping: t={t_curr} -> t={t_next}...")
+            
+            slice_t = adata_list_copy[i]      # Source
+            slice_tp1 = adata_list_copy[i+1]  # Target
+            
+            # 计算 PASTE2 (Partial Alignment)
+            # PASTE2 返回的是 pi (transport matrix)
+            # s: overlap percentage (0.0 - 1.0)
+            # alpha: 权衡基因表达(dissimilarity)和空间结构(Gromov)的参数
+            # try:
+            # 调用 PASTE2。具体 API 视版本而定，通常如下：
+            pi = paste2.PASTE2.partial_pairwise_align(
+                slice_t, 
+                slice_tp1, 
+                s=overlap,      # 关键参数：重叠率 (Partiality)
+                alpha=alpha,    # 使用参数传入的 alpha
+            )
+            # except Exception as e:
+            #     print(f"Error calling paste2: {e}")
+            #     print("Fallback: Using standard OT for this slice.")
+            #     # Fallback (简单 OT) 如果 PASTE2 失败
+            #     M = cdist(slice_t.obsm['spatial'], slice_tp1.obsm['spatial'])
+            #     a = np.ones((slice_t.n_obs,)) / slice_t.n_obs
+            #     b = np.ones((slice_tp1.n_obs,)) / slice_tp1.n_obs
+            #     pi = ot.emd(a, b, M)
 
-    a = jnp.array(d0['mass']) / np.sum(d0['mass'])
-    b = jnp.array(d1['mass']) / np.sum(d1['mass'])
+            # 保存 pi 用于后续 Flow Matching 训练
+            pi_list.append(pi)
+        
+        # 保存到缓存
+        if use_cache and file_paths is not None:
+            save_pi_cache(pi_list, file_paths, time_points, overlap, alpha, cache_dir)
+    else:
+        print(f"  [Cache] Using cached PASTE2 pi matrices, skipping computation...")
     
-    geom = geometry.Geometry(cost_matrix=cost, epsilon=epsilon)
-    prob = linear_problem.LinearProblem(geom, a=a, b=b, tau_a=tau, tau_b=tau)
-    solver = sinkhorn.Sinkhorn()
-    out = solver(prob)
-    ot_matrix = np.array(out.matrix)
+    # ==================================================
+    # 步骤 2: 使用 projection.partial_stack_slices_pairwise() 
+    #         将所有切片投影到同一坐标系
+    # ==================================================
+    print("  Projecting all slices onto the same coordinate system...")
+    try:
+        # 使用 paste2.projection.partial_stack_slices_pairwise() 进行统一投影
+        # 函数签名: partial_stack_slices_pairwise(slices, pis)
+        # slices: 切片列表 (AnnData 对象)
+        # pis: 相邻切片之间的 pi 矩阵列表
+        aligned_adata_list = projection.partial_stack_slices_pairwise(
+            adata_list_copy,
+            pi_list
+        )
+        
+        # 将投影后的坐标复制到原始 adata_list
+        # 函数返回的新切片中，obsm['spatial'] 已经被更新为投影后的坐标
+        for i, aligned_adata in enumerate(aligned_adata_list):
+            # 获取投影后的坐标（函数已经更新了 obsm['spatial']）
+            aligned_coords = aligned_adata.obsm['spatial'].copy()
+            
+            # 将投影后的坐标存储到原始 adata_list
+            adata_list[i].obsm['spatial_aligned'] = aligned_coords
+            
+            # 可选：添加 z 坐标用于 3D 重建
+            # 根据时间点分配 z 坐标
+            z_coords = np.full((aligned_coords.shape[0], 1), time_points[i])
+            spatial_3d = np.hstack([aligned_coords, z_coords])
+            adata_list[i].obsm['spatial_3d'] = spatial_3d
+            
+            print(f"    Slice t={time_points[i]}: Projected to common coordinate system (n_cells={aligned_coords.shape[0]})")
+            
+    except Exception as e:
+        print(f"Warning: projection.partial_stack_slices_pairwise() failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("Falling back to pairwise Procrustes alignment...")
+        
+        # Fallback: 使用原来的逐个对齐方法
+        adata_list[0].obsm['spatial_aligned'] = adata_list[0].obsm['spatial']
+        # 为第一个切片添加 z 坐标
+        z_coords_0 = np.full((adata_list[0].n_obs, 1), time_points[0])
+        spatial_3d_0 = np.hstack([adata_list[0].obsm['spatial_aligned'], z_coords_0])
+        adata_list[0].obsm['spatial_3d'] = spatial_3d_0
+        
+        for i in range(len(adata_list) - 1):
+            t_curr = time_points[i]
+            t_next = time_points[i+1]
+            pi = pi_list[i]
+            
+            # 获取 Source 坐标
+            if i == 0:
+                X = adata_list[i].obsm['spatial']
+            else:
+                X = adata_list[i].obsm['spatial_aligned']
+                
+            Y = adata_list[i+1].obsm['spatial']
+            
+            # 加权 Procrustes
+            row_sum = np.sum(pi, axis=1)
+            col_sum = np.sum(pi, axis=0)
+            
+            if np.sum(pi) < 1e-9:
+                print("Warning: PASTE2 returned near-zero coupling. Skipping alignment.")
+                R = np.eye(2)
+                t_vec = np.zeros(2)
+            else:
+                center_X = np.average(X, axis=0, weights=row_sum)
+                center_Y = np.average(Y, axis=0, weights=col_sum)
+                X_c = X - center_X
+                Y_c = Y - center_Y
+                
+                H = np.dot(Y_c.T, np.dot(pi.T, X_c))
+                U, S, Vt = np.linalg.svd(H)
+                R = np.dot(Vt.T, U.T)
+                
+                if np.linalg.det(R) < 0:
+                    Vt[1, :] *= -1
+                    R = np.dot(Vt.T, U.T)
+                
+                t_vec = center_X - np.dot(center_Y, R)
+            
+            Y_transformed = np.dot(adata_list[i+1].obsm['spatial'], R) + t_vec
+            adata_list[i+1].obsm['spatial_aligned'] = Y_transformed
+            
+            # 添加 z 坐标
+            z_coords = np.full((adata_list[i+1].n_obs, 1), time_points[i+1])
+            spatial_3d = np.hstack([Y_transformed, z_coords])
+            adata_list[i+1].obsm['spatial_3d'] = spatial_3d
     
-    # 可视化
-    if visualize and use_geodesic and cross_graph is not None and dist_geo is not None:
-        if save_path is None:
-            save_path = "geodesic_pairing_visualization.png"
-        visualize_geodesic_pairing(coords_x_np, coords_y_np, cross_graph, dist_geo, ot_matrix, save_path)
+    # 可视化最后一个对齐结果
+    if visualize and len(pi_list) > 0:
+        last_idx = len(adata_list) - 2
+        visualize_paste_alignment(
+            adata_list[last_idx], 
+            adata_list[last_idx + 1], 
+            pi_list[-1], 
+            time_points[last_idx], 
+            time_points[last_idx + 1]
+        )
+
+    return adata_list, pi_list
+# def align_spatial_slices(adata_list, time_points):
+ 
+#     print("Aligning spatial coordinates across slices...")
     
-    return ot_matrix
+#     aligned_coords_list = []
+    
+#     for i, adata in enumerate(adata_list):
+#         coords = adata.obsm['spatial'].copy()
+        
+#         # Center
+#         c_mean = np.mean(coords, axis=0)
+#         coords = coords - c_mean
+        
+#         scale = np.max(np.std(coords, axis=0)) + 1e-8
+#         coords = coords / scale
+        
+#         adata.obsm['spatial_aligned'] = coords # 暂存
+    
+    
+#     for i in range(len(adata_list)):
+#         coords = adata_list[i].obsm['spatial_aligned']
+        
+#         pca =  KMeans(n_clusters=1, n_init=1, max_iter=1).fit(coords) # 只是为了拿到中心，其实已经是0了
+#         u, s, vh = np.linalg.svd(coords.T @ coords)
+        
+#         angle = np.arctan2(vh[0, 1], vh[0, 0])
+#         R = np.array([
+#             [np.cos(-angle), -np.sin(-angle)],
+#             [np.sin(-angle),  np.cos(-angle)]
+#         ])
+#         coords_rotated = coords @ R.T
+        
+#         if i > 0:
+#             prev_coords = adata_list[i-1].obsm['spatial_aligned']
+            
+            
+#             best_coords = coords_rotated
+#             min_dist = np.inf
+            
+#             # 测试 4 种翻转: (x,y), (-x,y), (x,-y), (-x,-y)
+#             transforms = [
+#                 np.array([1, 1]), np.array([-1, 1]), 
+#                 np.array([1, -1]), np.array([-1, -1])
+#             ]
+            
+#             n_sub = min(500, coords_rotated.shape[0], prev_coords.shape[0])
+#             idx_curr = np.random.choice(coords_rotated.shape[0], n_sub, replace=False)
+#             idx_prev = np.random.choice(prev_coords.shape[0], n_sub, replace=False)
+#             sub_curr = coords_rotated[idx_curr]
+#             sub_prev = prev_coords[idx_prev]
+            
+#             for t_scale in transforms:
+#                 temp_coords = sub_curr * t_scale
+#                 d_matrix = cdist(temp_coords, sub_prev)
+#                 chamfer_dist = np.mean(np.min(d_matrix, axis=1)) + np.mean(np.min(d_matrix, axis=0))
+                
+#                 if chamfer_dist < min_dist:
+#                     min_dist = chamfer_dist
+#                     best_transform = t_scale
+            
+#             coords_rotated = coords_rotated * best_transform
+            
+#         adata_list[i].obsm['spatial_aligned'] = coords_rotated
+#         print(f"  Slice t={time_points[i]}: Aligned. (std={np.std(coords_rotated):.3f})")
+#     return adata_list
+# def visualize_geodesic_pairing(coords1, coords2, cross_graph, dist_geo, ot_matrix=None, save_path=None):
+#     """
+#     可视化测地线配对关系 (修改版：加入人工平移以解决坐标重叠问题)
+#     """
+#     fig = plt.figure(figsize=(20, 5))
+    
+#     # 1. 计算平移偏移量 (Shift)
+#     # 获取 coords1 的 X 轴范围
+#     x_min, x_max = np.min(coords1[:, 0]), np.max(coords1[:, 0])
+#     width = x_max - x_min
+#     if width == 0: width = 1.0
+    
+#     # 设置偏移量，让 Target 显示在 Source 的右侧，中间留一点空隙
+#     shift_x = width * 1.5
+    
+#     # 创建用于绘图的 Target 坐标副本
+#     coords2_vis = coords2.copy()
+#     coords2_vis[:, 0] += shift_x
+    
+#     # =========================================
+#     # 子图1: 空间分布 + Cross Graph 连接
+#     # =========================================
+#     ax1 = plt.subplot(1, 4, 1)
+    
+#     # 画点
+#     ax1.scatter(coords1[:, 0], coords1[:, 1], c='red', s=10, alpha=0.5, label='Source (t)', marker='o', edgecolors='none')
+#     ax1.scatter(coords2_vis[:, 0], coords2_vis[:, 1], c='blue', s=10, alpha=0.5, label='Target (t+1)', marker='s', edgecolors='none')
+    
+#     # 标注 Time Point
+#     ax1.text(np.mean(coords1[:, 0]), np.max(coords1[:, 1]) + width*0.1, "Time t", ha='center', fontsize=10, fontweight='bold')
+#     ax1.text(np.mean(coords2_vis[:, 0]), np.max(coords2_vis[:, 1]) + width*0.1, "Time t+1", ha='center', fontsize=10, fontweight='bold')
+    
+#     # 绘制 cross_graph 连接 (Geodesic 构建时的临近连接)
+#     # 为了避免太乱，只显示部分点的连接
+#     n1 = coords1.shape[0]
+#     n_show = min(100, n1)
+#     indices_to_show = np.linspace(0, n1-1, n_show, dtype=int)
+    
+#     # 获取稀疏矩阵的连接关系
+#     # cross_graph 是 [N1, N2] 的稀疏矩阵
+#     # 我们需要找到非零元素
+    
+#     cx = cross_graph.tocsr() # 转为 CSR 加速切片
+    
+#     for i in indices_to_show:
+#         # 找到第 i 个 Source 点连接的所有 Target 点
+#         # cross_graph[i, :] 非零的索引
+#         row = cx.getrow(i)
+#         target_indices = row.indices # 连接到的 Target 索引
+        
+#         for j in target_indices:
+#             ax1.plot([coords1[i, 0], coords2_vis[j, 0]], 
+#                     [coords1[i, 1], coords2_vis[j, 1]], 
+#                     'g-', alpha=0.2, linewidth=0.5)
+    
+#     ax1.set_title('Geodesic Graph Construction\n(Green lines = Cross Neighbors)', fontsize=10)
+#     ax1.legend(loc='lower right', fontsize=8)
+#     ax1.axis('off') #以此模式通常不需要坐标轴刻度
+    
+#     # =========================================
+#     # 子图2: 测地线距离矩阵热力图 (不变)
+#     # =========================================
+#     ax2 = plt.subplot(1, 4, 2)
+#     n_show1 = min(200, dist_geo.shape[0])
+#     n_show2 = min(200, dist_geo.shape[1])
+#     # 这里的距离是真实的测地线距离，不需要平移
+#     im = ax2.imshow(dist_geo[:n_show1, :n_show2], aspect='auto', cmap='viridis', origin='lower')
+#     ax2.set_title('Geodesic Distance Matrix\n(Subset)', fontsize=10)
+#     ax2.set_xlabel('Target Index')
+#     ax2.set_ylabel('Source Index')
+#     plt.colorbar(im, ax=ax2, label='Distance')
+    
+#     # =========================================
+#     # 子图3: OT 配对关系 (应用平移)
+#     # =========================================
+#     ax3 = plt.subplot(1, 4, 3)
+#     if ot_matrix is not None:
+#         # 画点
+#         ax3.scatter(coords1[:, 0], coords1[:, 1], c='red', s=10, alpha=0.5, marker='o', edgecolors='none')
+#         ax3.scatter(coords2_vis[:, 0], coords2_vis[:, 1], c='blue', s=10, alpha=0.5, marker='s', edgecolors='none')
+        
+#         # 找到主要配对
+#         # 这里的 OT Matrix 通常比较稠密(entropic)，我们只画权重最高的连线
+        
+#         # 策略：对于每个 Source 点，画出权重最大的那个 Target 连接
+#         # 为了避免画几千条线，我们只随机采样一些 Source 点
+#         n_lines_show = 150
+#         sample_indices = np.random.choice(ot_matrix.shape[0], min(n_lines_show, ot_matrix.shape[0]), replace=False)
+        
+#         for i in sample_indices:
+#             # 找到该行最大的权重的列索引 (argmax)
+#             j = np.argmax(ot_matrix[i, :])
+#             weight = ot_matrix[i, j]
+            
+#             # 只有当权重足够大时才画 (相对值)
+#             if weight > 1e-8:
+#                 ax3.plot([coords1[i, 0], coords2_vis[j, 0]], 
+#                         [coords1[i, 1], coords2_vis[j, 1]], 
+#                         'purple', alpha=0.4, linewidth=0.8)
+        
+#         ax3.set_title(f'Optimal Transport Map\n(Top-1 connection for random {min(n_lines_show, ot_matrix.shape[0])} cells)', fontsize=10)
+#     else:
+#         ax3.text(0.5, 0.5, 'No OT Matrix', ha='center', va='center')
+        
+#     ax3.axis('off')
+    
+#     # =========================================
+#     # 子图4: OT 矩阵热力图 (不变)
+#     # =========================================
+#     ax4 = plt.subplot(1, 4, 4)
+#     if ot_matrix is not None:
+#         n_show1 = min(200, ot_matrix.shape[0])
+#         n_show2 = min(200, ot_matrix.shape[1])
+#         im = ax4.imshow(ot_matrix[:n_show1, :n_show2], aspect='auto', cmap='magma', origin='lower')
+#         ax4.set_title('OT Coupling Matrix\n(Subset)', fontsize=10)
+#         ax4.set_xlabel('Target Index')
+#         ax4.set_ylabel('Source Index')
+#         plt.colorbar(im, ax=ax4, label='Probability')
+#     else:
+#         ax4.text(0.5, 0.5, 'No OT Matrix', ha='center', va='center')
+    
+#     plt.tight_layout()
+    
+#     if save_path:
+#         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+#         print(f"  [Visual] Saved OT visualization to: {save_path}")
+#     else:
+#         plt.show()
+    
+#     plt.close(fig)
+# def compute_geodesic_cost_matrix(coords1, coords2, n_neighbors=15, n_cross_neighbors=5, return_intermediate=False):
+#     """
+#     计算测地线距离，并强制保证 Source 和 Target 之间的连通性。
+    
+#     Parameters:
+#     -----------
+#     coords1 : np.ndarray
+#         Source 点集坐标
+#     coords2 : np.ndarray
+#         Target 点集坐标
+#     n_neighbors : int
+#         每个点集内部的邻居数
+#     n_cross_neighbors : int
+#         跨集连接的邻居数
+#     return_intermediate : bool
+#         是否返回中间结果（cross_graph, dist_geo）用于可视化
+    
+#     Returns:
+#     --------
+#     result : np.ndarray
+#         测地线距离矩阵的平方 [N1, N2]
+#     (cross_graph, dist_geo) : tuple, optional
+#         如果 return_intermediate=True，返回中间结果
+#     """
+#     n1 = coords1.shape[0]
+#     n2 = coords2.shape[0]
+    
+#     g1 = kneighbors_graph(coords1, n_neighbors=n_neighbors, mode='distance', include_self=False)
+#     g2 = kneighbors_graph(coords2, n_neighbors=n_neighbors, mode='distance', include_self=False)
+    
+#     nbrs_cross = NearestNeighbors(n_neighbors=n_cross_neighbors, algorithm='auto').fit(coords2)
+#     distances_cross, indices_cross = nbrs_cross.kneighbors(coords1)
+    
+#     cross_graph = lil_matrix((n1, n2))
+    
+
+#     for i in range(n1):
+#         for k in range(n_cross_neighbors):
+#             j = indices_cross[i, k]
+#             d = distances_cross[i, k]
+#             cross_graph[i, j] = d
+            
+#     from scipy.sparse import bmat
+#     combined_graph = bmat([
+#         [g1, cross_graph], 
+#         [cross_graph.T, g2]
+#     ])
+    
+#     dist_matrix_all = shortest_path(csgraph=combined_graph, directed=False, return_predecessors=False)
+#     dist_geo = dist_matrix_all[:n1, n1:]
+#     finite_mask = np.isfinite(dist_geo)
+#     if not np.any(finite_mask):
+#         print(" [Warning] Geodesic graph still totally disconnected! Fallback to Euclidean.")
+#         result = cdist(coords1, coords2, metric='sqeuclidean')
+#         if return_intermediate:
+#             return result, (None, None)
+#         return result
+    
+#     max_dist = np.max(dist_geo[finite_mask])
+#     dist_geo[~finite_mask] = max_dist * 1.5
+#     result = dist_geo ** 2
+    
+#     if return_intermediate:
+#         return result, (cross_graph, dist_geo)
+#     return result
+# def compute_unbalanced_ot(d0, d1, tau=0.8, epsilon=0.05, lambda_type=0.0, use_geodesic=False, visualize=False, save_path=None):
+#     """
+#     封装 OT 计算
+    
+#     Parameters:
+#     -----------
+#     d0 : dict
+#         Source 数据字典，包含 'coords', 'expr', 'type_onehot', 'mass'
+#     d1 : dict
+#         Target 数据字典，包含 'coords', 'expr', 'type_onehot', 'mass'
+#     tau : float
+#         Unbalanced OT 参数
+#     epsilon : float
+#         Sinkhorn 正则化参数
+#     lambda_type : float
+#         类型约束权重
+#     use_geodesic : bool
+#         是否使用测地线距离
+#     visualize : bool
+#         是否进行可视化
+#     save_path : str, optional
+#         可视化保存路径
+    
+#     Returns:
+#     --------
+#     ot_matrix : np.ndarray
+#         最优传输矩阵 [N1, N2]
+#     """
+#     coords_x, coords_y = jnp.array(d0['coords']), jnp.array(d1['coords'])
+#     coords_x_np,coords_y_np=np.array(d0['coords']),np.array(d1['coords'])
+    
+#     expr_x, expr_y = jnp.array(d0['expr']), jnp.array(d1['expr'])
+#     type_x, type_y = jnp.array(d0['type_onehot']), jnp.array(d1['type_onehot'])
+    
+#     cross_graph = None
+#     dist_geo = None
+    
+#     if use_geodesic:
+#         if visualize:
+#             dist_c_np, (cross_graph, dist_geo) = compute_geodesic_cost_matrix(
+#                 coords_x_np, coords_y_np, n_neighbors=15, return_intermediate=True)
+#         else:
+#             dist_c_np = compute_geodesic_cost_matrix(coords_x_np, coords_y_np, n_neighbors=15)
+#         dist_c = jnp.array(dist_c_np)
+#     else:
+#         coords_x, coords_y = jnp.array(coords_x_np), jnp.array(coords_y_np)
+#         dist_c = _pairwise_squared_distances(coords_x, coords_y)
+#     dist_e = _pairwise_squared_distances(expr_x, expr_y)
+    
+#     similarity_matrix = jnp.matmul(type_x, type_y.T)
+#     dist_type = 1.0 - similarity_matrix
+#     mean_c = jnp.mean(dist_c) + 1e-8
+#     mean_e = jnp.mean(dist_e) + 1e-8
+#     cost = (dist_c / mean_c) + (dist_e / mean_e) + lambda_type * dist_type
+#     # raw_cost = dist_c + dist_e + lambda_type * dist_type
+#     # scale_factor = jnp.mean(raw_cost) + 1e-8
+#     # cost = raw_cost / scale_factor
+
+#     a = jnp.array(d0['mass']) / np.sum(d0['mass'])
+#     b = jnp.array(d1['mass']) / np.sum(d1['mass'])
+    
+#     geom = geometry.Geometry(cost_matrix=cost, epsilon=epsilon)
+#     prob = linear_problem.LinearProblem(geom, a=a, b=b, tau_a=tau, tau_b=tau)
+#     solver = sinkhorn.Sinkhorn()
+#     out = solver(prob)
+#     ot_matrix = np.array(out.matrix)
+    
+#     # 可视化
+#     if visualize and use_geodesic and cross_graph is not None and dist_geo is not None:
+#         if save_path is None:
+#             save_path = "geodesic_pairing_visualization.png"
+#         visualize_geodesic_pairing(coords_x_np, coords_y_np, cross_graph, dist_geo, ot_matrix, save_path)
+    
+#     return ot_matrix
 
 # ==========================================
 # 4. 模型与训练 (支持传入 subset list)
@@ -585,22 +966,46 @@ class MassFlowMatching(nn.Module):
 
 class OTSampler:
     def __init__(self, ot_matrix):
+        # PASTE2 返回的矩阵可能非常稀疏且和不为 1
         self.ot_matrix = np.array(ot_matrix, dtype=np.float32)
-        self.row_sums = self.ot_matrix.sum(axis=1) + 1e-10
-        self.conditional_probs = self.ot_matrix / self.row_sums[:, None]
-        zero_rows = (self.row_sums < 1e-8)
-        self.conditional_probs[zero_rows] = 1.0 / self.ot_matrix.shape[1]
+        
+        # 归一化处理：虽然是 Partial，但在采样时，我们需要形成概率分布
+        # row_sums 表示 Source 中每个细胞 "流向未来" 的总质量
+        self.row_sums = self.ot_matrix.sum(axis=1) 
+        
+        # 避免除零：如果某行全为0 (细胞完全凋亡/无匹配)，
+        # 我们暂时给它分配一个极小的均匀概率，防止采样报错，
+        # 但对应的权重 (weight) 会是 0，所以在 Loss 中不会产生影响。
+        valid_rows = self.row_sums > 1e-9
+        
+        self.conditional_probs = np.zeros_like(self.ot_matrix)
+        # 只对有效的行进行归一化
+        self.conditional_probs[valid_rows] = self.ot_matrix[valid_rows] / self.row_sums[valid_rows, None]
+        
+        # 对无效行，随机指派一个 target (但在 Loss 计算时会被 weight=0 屏蔽)
+        n_target = self.ot_matrix.shape[1]
+        self.conditional_probs[~valid_rows] = 1.0 / n_target
+        
         self.conditional_probs_tensor = torch.tensor(self.conditional_probs, device=device)
         self.row_weights = torch.tensor(self.row_sums, device=device)
         self.n_source = self.ot_matrix.shape[0]
 
     def sample(self, batch_size):
+        # 1. 随机选择 Source 细胞
         row_indices = torch.randint(0, self.n_source, (batch_size,), device=device)
+        
+        # 2. 根据 OT 矩阵的条件概率选择 Target 细胞
         col_indices = torch.multinomial(self.conditional_probs_tensor[row_indices], num_samples=1).squeeze()
+        
+        # 如果 row_sum < 1 (比如 0.1)，说明该细胞大部分"死亡"了。
+        # 如果 row_sum 很大 (在 Unbalanced OT 中可能发生)，说明增殖了。
+        # 在 PASTE2 (partial matching) 中，通常 sum <= 1。
+        # 这里的 weights 将直接作为 mass_scaling_factor 的监督信号。
         weights = self.row_weights[row_indices]
+        
         return row_indices.cpu().numpy(), col_indices.cpu().numpy(), weights.cpu().numpy()
 
-def train_model(train_data_list, train_times, feat_dim,epochs=1000, batch_size=256, visualize_ot=False):
+def train_model(train_data_list, train_times, ot_matrices_dict, feat_dim,epochs=1000, batch_size=256):
     ot_matrices = []
     samplers = []
     
@@ -612,15 +1017,21 @@ def train_model(train_data_list, train_times, feat_dim,epochs=1000, batch_size=2
         t_range = 1.0  # 避免除零
     
     # print(f"  Computing OT matrices for sequence: {train_times}")
+    # for i in range(len(train_data_list) - 1):
+    #     d0 = train_data_list[i]
+    #     d1 = train_data_list[i+1]
+    #     # 只可视化第一个 OT 矩阵
+    #     vis = visualize_ot
+    #     save_path = f"geodesic_pairing_t{train_times[i]}_to_t{train_times[i+1]}.png" if vis else None
+    #     ot = compute_unbalanced_ot(d0, d1, epsilon=0.01, visualize=vis, save_path=save_path)
+    #     samplers.append(OTSampler(ot))
+    #     ot_matrices.append(ot)
     for i in range(len(train_data_list) - 1):
-        d0 = train_data_list[i]
-        d1 = train_data_list[i+1]
-        # 只可视化第一个 OT 矩阵
-        vis = visualize_ot
-        save_path = f"geodesic_pairing_t{train_times[i]}_to_t{train_times[i+1]}.png" if vis else None
-        ot = compute_unbalanced_ot(d0, d1, epsilon=0.01, visualize=vis, save_path=save_path)
-        samplers.append(OTSampler(ot))
-        ot_matrices.append(ot)
+        t_current = train_times[i]
+        ot_matrix = ot_matrices_dict[t_current]
+        ot_matrices.append(ot_matrix)
+        samplers.append(OTSampler(ot_matrix))
+        print(f"  Loaded PASTE matrix for t={t_current} -> t={train_times[i+1]}")
         
     model = MassFlowMatching(expression_dim=feat_dim, hidden_dim=256)
     model = model.to(device)
@@ -632,7 +1043,6 @@ def train_model(train_data_list, train_times, feat_dim,epochs=1000, batch_size=2
     
     for epoch in range(epochs):
         optimizer.zero_grad()
-        total_loss = 0
         interval_idx = np.random.randint(0, n_intervals)
         sampler = samplers[interval_idx]
         
@@ -674,12 +1084,9 @@ def train_model(train_data_list, train_times, feat_dim,epochs=1000, batch_size=2
         n_cells_0 = d0['n_cells']
         n_cells_1 = d1['n_cells']
         
-        raw_growth = weights_tensor * n_cells_1
         global_ratio = n_cells_1 / n_cells_0
-        relative_growth = raw_growth / (global_ratio + 1e-6)
-        
-        target_growth_factor = torch.clamp(relative_growth * global_ratio, 0.1, 10.0)
-        
+        raw_growth_factor = weights_tensor * global_ratio
+        target_growth_factor = torch.clamp(raw_growth_factor, 0.01, 10.0)
         k_target = torch.log(target_growth_factor)
         
         # E. 前向传播
@@ -810,12 +1217,16 @@ def run_leave_one_out_benchmark(args):
     adata_list = [sc.read_h5ad(f) for f in files]
     
     # 按时间排序输入
-    sorted_pairs = sorted(zip(times, adata_list))
+    sorted_pairs = sorted(zip(times, files, adata_list))
     sorted_times = [p[0] for p in sorted_pairs]
-    sorted_adatas = [p[1] for p in sorted_pairs]
+    sorted_files = [p[1] for p in sorted_pairs]
+    sorted_adatas = [p[2] for p in sorted_pairs]
     
     use_pca = not args.no_pca
-    data_dict, scalers, feat_dim = preprocess_multislice(sorted_adatas, sorted_times, use_pca=use_pca)
+    data_dict, scalers,feat_dim,ot_matrices_dict = preprocess_multislice(
+        sorted_adatas, sorted_times, use_pca=use_pca, 
+        file_paths=sorted_files, use_cache=True
+    )
     
     results = []
     
@@ -840,7 +1251,7 @@ def run_leave_one_out_benchmark(args):
         
         print(f"1. Training on sequence: {train_times}")
         # B. 训练
-        model, t_min, t_range = train_model(train_data_list, train_times, feat_dim=feat_dim, epochs=args.epochs, visualize_ot=args.visualize_ot)
+        model, t_min, t_range = train_model(train_data_list, train_times, ot_matrices_dict, feat_dim=feat_dim, epochs=args.epochs)
         
         # C. 预测
         # 找到训练集中最近的"过去"时间点
@@ -892,6 +1303,5 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1000, help="Epochs for each training fold")
     parser.add_argument("--output", type=str, default="benchmark_results.csv")
     parser.add_argument("--no_pca", action="store_true", help="If set, skip PCA and use HVGs directly")
-    parser.add_argument("--visualize_ot", action="store_true", help="If set, visualize geodesic pairing for the first OT matrix")
     args = parser.parse_args()
     run_leave_one_out_benchmark(args)

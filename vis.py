@@ -1,6 +1,6 @@
 import scanpy as sc
 import numpy as np
-day=5.0
+day=10.0
 adata = sc.read_h5ad(f"data/day{day}_pred.h5ad")
 print(adata)
 origin_adata=sc.read_h5ad(f"data/day{day}_gt.h5ad")
